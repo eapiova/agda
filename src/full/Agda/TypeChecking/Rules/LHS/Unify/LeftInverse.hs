@@ -24,8 +24,6 @@ import Agda.Syntax.Internal
 import Agda.Syntax.Scope.Monad (freshAbstractQName)
 
 import {-# SOURCE #-} Agda.TypeChecking.CompiledClause.Compile (compileClauses)
-import Agda.TypeChecking.Constraints (noConstraints)
-import Agda.TypeChecking.Conversion (equalTerm)
 import Agda.TypeChecking.Monad
 import Agda.TypeChecking.Primitive hiding (Nat)
 import Agda.TypeChecking.Names
@@ -541,7 +539,9 @@ buildEquiv (DUnificationStep st step@(DInjectivity k a d pars ixs ch) _output) n
           unsupported :: ExceptT NoLeftInv TCM b
           unsupported = throwError $ UnsupportedYet rawStep
           unsupportedBecause :: String -> ExceptT NoLeftInv TCM b
-          unsupportedBecause _ = unsupported
+          unsupportedBecause reason = do
+            reportSDoc "tc.lhs.unify.inv" 20 $ "DInjectivity unsupported:" <+> text reason
+            unsupported
           cantTransport' :: ExceptT (Closure Type) TCM b -> ExceptT NoLeftInv TCM b
           cantTransport' m = withExceptT CantTransport' m
           cantTransport :: ExceptT (Closure (Abs Type)) TCM b -> ExceptT NoLeftInv TCM b
@@ -596,29 +596,31 @@ buildEquiv (DUnificationStep st step@(DInjectivity k a d pars ixs ch) _output) n
           Control.Monad.unless (supportsIndexedFieldInjectivity ctel) $
             unsupportedBecause "support predicate"
           Control.Monad.unless (componentCount == size ctel - hiddenPrefixCount) $ unsupportedBecause "component count"
-          prefixEqual <- forM (zip3 (take hiddenPrefixCount $ telToList ctel) hiddenPrefixArgs0 hiddenPrefixVArgs0) $ \ (dom, uj, vj) ->
-            lift $
-              addContext gamma $
-                (noConstraints (equalTerm (snd $ unDom dom) (unArg uj) (unArg vj)) $> True)
-                  `catchError` \ _ -> pure False
-          Control.Monad.unless (and prefixEqual) $ unsupportedBecause "hidden prefix equality"
+          -- The dependent-hidden-prefix path (where hidden prefix args may differ on the
+          -- two sides and we interpolate via projections of p) only works when those
+          -- projections are legal. For erased hidden prefix positions the decode would
+          -- project erased fields in non-erased context; fall back for those.
+          Control.Monad.when (any (hasQuantity0 . getModality) $ take hiddenPrefixCount $ telToList ctel) $
+            unsupportedBecause "erased hidden prefix"
         Control.Monad.when (not indexedWithFields && not (isNonDependentTelescope ctel)) $
           unsupportedBecause "non-dependent telescope"
 
         aLType <- caseMaybeM (lift $ addContext gamma $ toLType a) (unsupportedBecause "toLType injectType") pure
-        (componentFieldNames, componentLTys, useGeneratedProjections) <- if indexedWithFields then do
+        (allFieldNames, componentLTys, useGeneratedProjections) <- if indexedWithFields then do
           (projNames, projTypes) <- lift $ defineInjectivityProjections gamma a ch ctel
           ltys <- forM (drop hiddenPrefixCount projTypes) $ \ dom ->
             caseMaybeM
               (lift $ addContext gamma $ addContext ("d" :: String, defaultDom a) $ toLType $ unDom dom)
               (unsupportedBecause "toLType generated projection")
               pure
-          pure (drop hiddenPrefixCount projNames, ltys, True)
+          pure (projNames, ltys, True)
         else do
           Control.Monad.unless (length (conFields ch) == size ctel) $ unsupportedBecause "conFields unavailable"
           fieldLTys <- forM (telToList ctel) $ \ dom ->
             caseMaybeM (lift $ addContext gamma $ toLType $ snd $ unDom dom) (unsupportedBecause "toLType field") pure
-          pure (drop hiddenPrefixCount $ map unArg $ conFields ch, drop hiddenPrefixCount fieldLTys, False)
+          pure (map unArg $ conFields ch, drop hiddenPrefixCount fieldLTys, False)
+        let componentFieldNames = drop hiddenPrefixCount allFieldNames
+            hiddenFieldNames    = take hiddenPrefixCount allFieldNames
 
         interval <- lift primIntervalType
         let gamma_phis = abstract gamma $ telFromList $
@@ -688,6 +690,19 @@ buildEquiv (DUnificationStep st step@(DInjectivity k a d pars ixs ch) _output) n
                     pure $ defApp proj [] (map Apply gammaArgs ++ [Apply $ Arg ai t])
                 | otherwise =
                     pure $ defApp proj [] [Apply (Arg ai t)]
+              -- Decode with path-varying hidden args: at interval i, each hidden prefix
+              -- position is `proj_k(p i)`, which smoothly interpolates from u_k_hidden
+              -- to v_k_hidden. This is required when the hidden prefix is not
+              -- definitionally equal on the two sides (e.g., Fin.suc in drop-there).
+              decodeComponents' mp0 mp1 mp rhss qs = lam "i" $ \ i -> do
+                pi <- mp <@@> (mp0, mp1, i)
+                hiddenArgs <- forM (zip hiddenFieldNames (take hiddenPrefixCount fieldArgInfo)) $ \ (proj, ai) -> do
+                  Arg ai <$> projApp ai proj pi
+                compArgs <- sequence $
+                  zipWith4
+                    (\ ai q uj rhs -> Arg ai <$> (q <@@> (uj, rhs, i)))
+                    componentArgInfo qs componentUArgs rhss
+                pure $ Con ch ConOSystem (map Apply $ hiddenArgs ++ compArgs)
               decodeComponents hiddenArgs0 rhss qs = lam "i" $ \ i -> do
                 hiddenArgs <- hiddenArgs0
                 compArgs <- sequence $
@@ -697,13 +712,20 @@ buildEquiv (DUnificationStep st step@(DInjectivity k a d pars ixs ch) _output) n
                 pure $ Con ch ConOSystem (map Apply $ hiddenArgs ++ compArgs)
               encodeComponents fieldData p0 p1 p = forM fieldData $ \ (ai, lAbs, tyAbs, uj, _vj, proj) -> do
                 reflj <- lam "i" $ \ _ -> uj
+                -- Family: transport parameter i slides j along a path-dependent type.
+                -- At each i, PathP has type family (λ j → A_j[proj(p (i ∧ j))]) giving
+                -- dependent paths u_j ≡ proj_j(p i) whose endpoint type tracks the
+                -- hidden prefix variance along the constructor path.
                 fam <- lam "i" $ \ i -> do
                   pi <- p <@@> (p0, p1, i)
                   rhs <- projApp ai proj pi
                   l <- absApp <$> lAbs <*> pure pi
-                  ty <- absApp <$> tyAbs <*> pure pi
-                  cty <- lam "j" $ \ _ -> pure ty
+                  cty <- lam "j" $ \ j -> do
+                    let ij = cl (lift primIMin) <@> i <@> j
+                    pij <- p <@@> (p0, p1, ij)
+                    absApp <$> tyAbs <*> pure pij
                   cl (lift primPathP) <#> pure l <@> pure cty <@> uj <@> pure rhs
+                -- Level family over the transport parameter i
                 la <- lam "i" $ \ i -> do
                   pi <- p <@@> (p0, p1, i)
                   absApp <$> lAbs <*> pure pi
@@ -720,8 +742,9 @@ buildEquiv (DUnificationStep st step@(DInjectivity k a d pars ixs ch) _output) n
                 ty <- open $ raiseFrom gamma t
                 pure (ai, fmap (Abs "d" . raise 1) l, fmap (Abs "d" . raise 1) ty, uj, vj, proj)
 
-            qterms <- encodeComponents fieldData u v =<< open (unArg p_arg0)
-            decodeP <- decodeComponents hiddenUArgs0 componentVArgs (map pure qterms)
+            pTerm <- open $ unArg p_arg0
+            qterms <- encodeComponents fieldData u v pTerm
+            decodeP <- decodeComponents' u v pTerm componentVArgs (map pure qterms)
             leftInvP <- do
               p <- open $ unArg p_arg0
               base <- lam "j" $ \ _ -> u
@@ -733,7 +756,7 @@ buildEquiv (DUnificationStep st step@(DInjectivity k a d pars ixs ch) _output) n
                   rij <- cl (lift primIMin) <@> r <@> j
                   p <@@> (u, pure pr, pure rij)
                 qs <- encodeComponents fieldData u (pure pr) (pure part)
-                dec <- decodeComponents hiddenUArgs0 rhss (map pure qs)
+                dec <- decodeComponents' u (pure pr) (pure part) rhss (map pure qs)
                 cty <- lam "i" $ \ _ -> aTerm
                 cl (lift primPathP) <#> aLevel <@> pure cty <@> pure dec <@> pure part
               cl (lift primTrans) <#> pure la <@> pure fam <@> pure iz <@> pure base
