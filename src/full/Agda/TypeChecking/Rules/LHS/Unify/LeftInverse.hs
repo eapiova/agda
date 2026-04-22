@@ -121,7 +121,7 @@ buildLeftInverse s0 log = Bench.billTo [Bench.UnifyIndices, Bench.CubicalLeftInv
       cond = andM
         -- TODO: handle open contexts: they happen during "higher dimensional" unification,
         --       in injectivity cases.
-        [ null <$> getContext
+        [ null <$!> getContext
         ]
 
       compose :: [(Retract, Term)] -> ExceptT NoLeftInv TCM Retract
@@ -146,13 +146,13 @@ buildLeftInverse s0 log = Bench.billTo [Bench.UnifyIndices, Bench.CubicalLeftInv
         -- leftInv0 : [wkS |φ,us =_Δ vs| ρ,1,refls][τ] = idS : Γ,φ,us =_Δ vs
         let tau = tau0 `composeS` raiseS 1
         unview <- intervalUnview'
-        let replaceAt n x xs = xs0 ++ x:xs1
-                    where (xs0,_:xs1) = splitAt n xs
+        let replaceAt n x xs = xs0 ++! (x:xs1)
+                    where (xs0,_:xs1) = splitAt' n xs
         let max r s = unview $ IMax (argN r) (argN s)
             neg r = unview $ INeg (argN r)
         let phieq = neg (var 0) `max` var (size (eqTel s0) + 1)
                           -- I + us =_Δ vs -- inplaceS
-        let leftInv = termsS __IMPOSSIBLE__ $ replaceAt (size (varTel s0)) phieq $ map (lookupS leftInv0) $ downFrom (size (varTel s0) + 1 + size (eqTel s0))
+        let leftInv = termsS __IMPOSSIBLE__ $ replaceAt (size (varTel s0)) phieq $ map' (lookupS leftInv0) $ downFrom (size (varTel s0) + 1 + size (eqTel s0))
         let working_tel = abstract (varTel s0) (ExtendTel __DUMMY_DOM__ $ Abs "phi0" $ (eqTel s0))
         reportSDoc "tc.lhs.unify.inv" 20 $ "=== before mod"
         do
@@ -253,20 +253,20 @@ composeRetract (prob0,rho0,tau0,leftInv0) phi0 (prob1,rho1,tau1,leftInv1) = do
   interval <- primIntervalType
   max <- primIMax
   neg <- primINeg
-  result <- sequenceA <$> do
+  result <- sequenceA <$!> do
     addContext prob0 $ runNamesT (teleNames prob0) $ do
              phi <- open phi0
              g0 <- open $ raise (size prob0) prob0
              step0 <- open $ Abs "i" $ step0 `applySubst` teleArgs prob0
-             leftInv0 <- open $ Abs "i" $ map unArg $ leftInv0 `applySubst` teleArgs prob0
+             leftInv0 <- open $ Abs "i" $ map' unArg $ leftInv0 `applySubst` teleArgs prob0
              bind "i" $ \ i -> addContext ("i" :: String, defaultDom interval) $ do
               tel <- bind "_" $ \ (_ :: NamesT tcm Term) -> g0
-              step0i <- lazyAbsApp <$> step0 <*> i
+              step0i <- lazyAbsApp <$!> step0 <*!> i
               face <- pure max <@> (pure neg <@> i) <@> phi
               leftInv0 <- leftInv0
               i <- i
               -- this composition could be optimized further whenever step0i is actually constant in i.
-              lift $ runExceptT (map unArg <$> transpSysTel' True tel [(i, leftInv0)] face step0i)
+              lift $ runExceptT (map' unArg <$> transpSysTel' True tel [(i, leftInv0)] face step0i)
   case result of
     Left  cl      -> pure (Left cl)
     Right leftInv -> do
@@ -388,9 +388,9 @@ buildEquiv (DUnificationStep st step@(DSolution k ty fx tm side) output) next = 
         interval <- lift $ primIntervalType
          -- Γ, φ : I
         let gamma_phis = abstract gamma $ telFromList $
-              map (defaultDom . (,interval) . ("phi" ++) . show) [0 .. phis - 1]
+              map' (defaultDom . (,interval) . ("phi" ++) . show) [0 .. phis - 1]
         -- working_tel = Γ, φ : I, eqs : lhs ≡ rhs
-        working_tel <- abstract gamma_phis <$>
+        working_tel <- abstract gamma_phis <$!>
           cantTransport' (pathTelescope' (raise phis $ eqTel st) (raise phis $ eqLHS st) (raise phis $ eqRHS st))
         -- working_tel' = Γ'           , φ : I, eqs : lhs ≡ rhs
         --              = Γ₁, x : A, Γ₂, φ : I, eqs : lhs ≡ rhs
@@ -415,11 +415,11 @@ buildEquiv (DUnificationStep st step@(DSolution k ty fx tm side) output) next = 
 
           -- . ⊢ Γ₁  ,  γ₁. x : A, Γ₂, φ : I, eqs : lhs ≡ rhs
           let (gamma1, xxi) = bindSplit $ splitTelescopeAt (size gamma - x - 1) working_tel'
-              (gamma1_args,xxi_args) = splitAt (size gamma1) all_args
+              (gamma1_args,xxi_args) = splitAt' (size gamma1) all_args
               (_x_arg:xi_args) = xxi_args
-              (x_arg:xi0,k_arg:xi1) = splitAt (size gamma - size gamma1 + phis + k) xxi_args
+              (x_arg:xi0,k_arg:xi1) = splitAt' (size gamma - size gamma1 + phis + k) xxi_args
               -- working_tel ⊢ x : A, Γ₂, φ : I, eqs : lhs ≡ rhs
-              xxi_here = absAppN xxi $ map unArg gamma1_args
+              xxi_here = absAppN xxi $ map' unArg gamma1_args
               --                                                  x:A, Γ₂               φ
               (xpre,krest) = bindSplit $ splitTelescopeAt ((size gamma - size gamma1) + phis + k) xxi_here
           k_arg <- open $ unArg k_arg
@@ -428,11 +428,11 @@ buildEquiv (DUnificationStep st step@(DSolution k ty fx tm side) output) next = 
           -- Δ₀ = Γ₁, Γ₂
           -- Δ  = x eq. Δ₀, φ : I, eqs-k : lhs-k ≡ rhs-k
           delta <- bindN ["x","eq"] $ \ [x,eq] -> do
-                     let pre = apply1 <$> xpre <*> x
+                     let pre = apply1 <$!> xpre <*!> x
                      abstractN pre $ \ args ->
-                       apply1 <$> applyN krest (x:args) <*> eq
+                       apply1 <$!> applyN krest (x:args) <*!> eq
           -- working_tel ⊢ delta0_args : Δ₀
-          let delta0_args = xi0 ++ xi1
+          let delta0_args = xi0 ++! xi1
           let appSide = case side of
                           Left{} -> id
                           Right{} -> unview . INeg . argN
@@ -440,17 +440,17 @@ buildEquiv (DUnificationStep st step@(DSolution k ty fx tm side) output) next = 
                   -- csingl :: NamesT tcm Term -> NamesT tcm [Arg Term]
                   csingl i = mapM (fmap defaultArg) $ csingl' i
                   -- csingl' :: NamesT tcm Term -> [NamesT tcm Term]
-                  csingl' i = [ k_arg <@@> (u, v, appSide <$> i)
+                  csingl' i = [ k_arg <@@> (u, v, appSide <$!> i)
                               , lam "j" $ \ j ->
                                   let r i j = case side of
                                             Left{} -> unview (IMax (argN j) (argN i))
                                             Right{} -> unview (IMin (argN j) (argN . unview $ INeg $ argN i))
-                                  in k_arg <@@> (u, v, r <$> i <*> j)
+                                  in k_arg <@@> (u, v, r <$!> i <*!> j)
                               ]
-          let replaceAt n x xs = xs0 ++ x:xs1
-                where (xs0,_:xs1) = splitAt n xs
-              dropAt n xs = xs0 ++ xs1
-                where (xs0,_:xs1) = splitAt n xs
+          let replaceAt n x xs = xs0 ++! (x:xs1)
+                where (xs0,_:xs1) = splitAt' n xs
+              dropAt n xs = xs0 ++! xs1
+                where (xs0,_:xs1) = splitAt' n xs
           delta <- open delta
           -- d = i. Δ (k i) (λ j → k (i ∧ j))
           d <- bind "i" $ \ i -> applyN delta (csingl' i)
@@ -465,13 +465,13 @@ buildEquiv (DUnificationStep st step@(DSolution k ty fx tm side) output) next = 
           -- when checking if "t" depends on "x" to decide what
           -- to transp and what not to.
           let flag = True
-          tau <- (gamma1_args ++) <$> lift (cantTransport (transpTel' flag d phi delta0_args))
+          tau <- (gamma1_args ++!) <$!> lift (cantTransport (transpTel' flag d phi delta0_args))
           reportSDoc "tc.lhs.unify.inv" 20 $ "tau    :" <+> prettyTCM (map (setHiding NotHidden) tau)
           leftInv <- do
             gamma1_args <- open gamma1_args
             phi <- open phi
             -- xxi_here <- open xxi_here
-            -- (xi_here_f :: Abs Telescope) <- bind "i" $ \ i -> apply <$> xxi_here <*> (take 1 `fmap` csingl i)
+            -- (xi_here_f :: Abs Telescope) <- bind "i" $ \ i -> apply <$> xxi_here <*> (take' 1 `fmap` csingl i)
             -- xi_here_f <- open xi_here_f
             -- xi_args <- open xi_args
             -- xif <- bind "i" $ \ i -> do
@@ -481,27 +481,27 @@ buildEquiv (DUnificationStep st step@(DSolution k ty fx tm side) output) next = 
 
             xi0 <- open xi0
             xi1 <- open xi1
-            delta0 <- bind "i" $ \ i -> apply <$> xpre <*> (take 1 `fmap` csingl i)
+            delta0 <- bind "i" $ \ i -> apply <$!> xpre <*!> (take' 1 <$!> csingl i)
             delta0 <- open delta0
             xi0f <- bind "i" $ \ i -> do
-                                 m <- trFillTel' flag <$> delta0 <*> phi <*> xi0 <*> i
+                                 m <- trFillTel' flag <$!> delta0 <*!> phi <*!> xi0 <*!> i
                                  lift (cantTransport m)
             xi0f <- open xi0f
 
             delta1 <- bind "i" $ \ i -> do
 
-                   args <- mapM (open . unArg) =<< (lazyAbsApp <$> xi0f <*> i)
-                   apply <$> applyN krest (take 1 (csingl' i) ++ args) <*> (drop 1 `fmap` csingl i)
+                   args <- mapM (open . unArg) =<< (lazyAbsApp <$!> xi0f <*!> i)
+                   apply <$> applyN krest (take' 1 (csingl' i) ++! args) <*!> (drop 1 <$!> csingl i)
             delta1 <- open delta1
             xi1f <- bind "i" $ \ i -> do
-                                 m <- trFillTel' flag <$> delta1 <*> phi <*> xi1 <*> i
+                                 m <- trFillTel' flag <$!> delta1 <*!> phi <*!> xi1 <*!> i
                                  lift (cantTransport m)
             xi1f <- open xi1f
             fmap absBody $ bind "i" $ \ i' -> do
-              let (+++) m = liftM2 (++) m
+              let (+++) m = liftM2 (++!) m
                   i = cl (lift primINeg) <@> i'
               fmap (permute (invertP __IMPOSSIBLE__ permw)) $
-                gamma1_args +++ (take 1 `fmap` csingl i +++ ((lazyAbsApp <$> xi0f <*> i) +++ (drop 1 `fmap` csingl i +++ (lazyAbsApp <$> xi1f <*> i))))
+                gamma1_args +++ ((take' 1 <$!> csingl i) +++ ((lazyAbsApp <$!> xi0f <*!> i) +++ ((drop 1 <$!> csingl i) +++ (lazyAbsApp <$!> xi1f <*!> i))))
           return (tau,leftInv,phi)
         iz <- lift $ primIZero
         io <- lift $ primIOne
@@ -528,11 +528,11 @@ buildEquiv (DUnificationStep st step@(DSolution k ty fx tm side) output) next = 
         reportSDoc "tc.lhs.unify.inv" 20 $ text "new_sizes: " <+> pretty (size $ varTel next, size $ eqTel next)
         addContext (varTel next) $ addContext ("φ" :: String, __DUMMY_DOM__) $ addContext (raise 1 $ eqTel next) $
           reportSDoc "tc.lhs.unify.inv" 20 $ "rho   :" <+> prettyTCM rho
-        return $ ((working_tel
-                 , rho
-                 , termsS __IMPOSSIBLE__ $ map unArg tau
-                 , termsS __IMPOSSIBLE__ $ map unArg leftInv)
-                 , phi)
+        return ((working_tel
+                , rho
+                , termsS __IMPOSSIBLE__ $ map' unArg tau
+                , termsS __IMPOSSIBLE__ $ map' unArg leftInv)
+                , phi)
 buildEquiv (DUnificationStep st step@(DInjectivity k a d pars ixs ch) _output) next = runExceptT $ do
         let
           rawStep = Injectivity k a d pars ixs ch
@@ -815,8 +815,8 @@ buildEquiv (DUnificationStep st step@(DEtaExpandVar fv _d _args) output) next = 
         interval <- lift primIntervalType
          -- Γ, φs : I^phis
         let gamma_phis = abstract gamma $ telFromList $
-              map (defaultDom . (,interval) . ("phi" ++) . show) [0 .. phis - 1]
-        working_tel <- abstract gamma_phis <$> do
+              map' (defaultDom . (,interval) . ("phi" ++) . show) [0 .. phis - 1]
+        working_tel <- abstract gamma_phis <$!> do
          withExceptT CantTransport' $
           pathTelescope' (raise phis $ eqTel st) (raise phis $ eqLHS st) (raise phis $ eqRHS st)
         let raiseFrom tel x = (size working_tel - size tel) + x
