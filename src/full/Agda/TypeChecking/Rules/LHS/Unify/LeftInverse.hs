@@ -90,6 +90,7 @@ instance PrettyTCM NoLeftInv where
   prettyTCM SplitOnFlat        = fwords "It splits on a @♭ argument"
   prettyTCM (CantTransport t)  = fsep $ pwords "The type" <> [prettyTCM t] <> pwords "can not be transported"
   prettyTCM (CantTransport' t) = fsep $ pwords "The type" <> [prettyTCM t] <> pwords "can not be transported"
+  prettyTCM CantCompose        = fwords "It relies on a sequence of unification steps whose per-step retracts cannot be composed (known nested-cons interaction)"
 
 data NoLeftInv
   = UnsupportedYet {badStep :: UnifyStep}
@@ -101,6 +102,11 @@ data NoLeftInv
   | UnsupportedCxt
   | CantTransport  (Closure (Abs Type))
   | CantTransport' (Closure Type)
+  | CantCompose
+    -- ^ composeRetract hit an Impossible: a specific interaction of
+    --   DInjectivity and DSolution steps whose retracts don't mix
+    --   cleanly. Caught to avoid crashing the typechecker; clause is
+    --   treated as UnsupportedYet. See eval/prefix-nested-cons-discovery.md.
   deriving Show
 
 -- | Build the left inverse part of a 'UnifyEquiv' (@τ@, @leftInv@).
@@ -129,9 +135,21 @@ buildLeftInverse s0 log = Bench.billTo [Bench.UnifyIndices, Bench.CubicalLeftInv
       compose [(xs, _)] = pure xs
       compose ((x, t):xs) = do
         r <- compose xs
-        ExceptT $ composeRetract x t r <&> \case
-          Left e  -> Left (CantTransport e)
-          Right x -> Right x
+        -- Catch Impossible from composeRetract: a DInjectivity / DSolution
+        -- interaction on specific nested-cons shapes produces retracts whose
+        -- substitutions compose out-of-range. Rather than crash the
+        -- typechecker, treat the clause as CantCompose (i.e., emit
+        -- UnsupportedIndexedMatch). See
+        -- eval/prefix-nested-cons-discovery.md for the precise trigger.
+        -- The CatchImpossible TCM instance rolls back TCState so the
+        -- projection definitions added by defineInjectivityProjections in
+        -- the earlier DInjectivity step are also reverted.
+        caught <- lift $ (Just <$> composeRetract x t r) `catchImpossible`
+                         \_ -> return Nothing
+        case caught of
+          Nothing           -> throwError CantCompose
+          Just (Left e)     -> throwError (CantTransport e)
+          Just (Right res)  -> pure res
 
     ifNotM cond (return $ Left UnsupportedCxt) $ do
     equivs <- forM log $ uncurry buildEquiv
@@ -551,7 +569,14 @@ buildEquiv (DUnificationStep st step@(DInjectivity k a d pars ixs ch) _output) n
         reportSDoc "tc.lhs.unify.inv" 20 $ "step unifyState:" <+> prettyTCM st
         reportSDoc "tc.lhs.unify.inv" 20 $ "step step:" <+> addContext (varTel st) (prettyTCM step)
 
-        Datatype{ dataIxs = nixs } <- theDef <$> (lift $ getConstInfo d)
+        -- Guard: the index type must be a datatype. For records or other
+        -- forms of the type `d`, we cannot perform injectivity reasoning
+        -- the same way; fall back cleanly instead of panicking on a
+        -- do-block pattern-match failure.
+        dDef <- theDef <$> (lift $ getConstInfo d)
+        nixs <- case dDef of
+          Datatype{ dataIxs = n } -> pure n
+          _                       -> unsupportedBecause "type constructor is not a datatype"
 
         let
           gamma = varTel st
