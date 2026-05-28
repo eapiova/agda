@@ -345,7 +345,7 @@ defineInjectivityProjections prefixTel a con ctel = do
   forM_ (zip3 (downFrom $ size fieldTypes) names fieldTypes) $ \ (i, projName, ty) -> do
     let
       projType = abstract projTel <$> ty
-      cpi    = ConPatternInfo defaultPatternInfo False False (Just $ argN $ raise (size ctel) a) False
+      cpi    = ConPatternInfo defaultPatternInfo False False (Just $ argN $ raise (size ctel) a) False empty
       conp   = defaultNamedArg $ ConP con cpi $ teleNamedArgs ctel
       sigma  = Con con ConOSystem (map Apply $ teleArgs ctel) `consS` raiseS (size ctel)
       clause = empty
